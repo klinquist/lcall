@@ -9,6 +9,7 @@ const inquirer = require('inquirer');
 const path = require('path');
 const parser = require('xml2json');
 const dir = path.resolve(path.join(__dirname, '.config'));
+const geolib = require('geolib');
 
 const HAMQTH_TOKEN_EXPIRE_MINUTES = 60
 
@@ -22,14 +23,13 @@ const get = (p, o) => {
 
 
 
-const getToken = async (credentials) => {
+const getSavedCredentials = async (credentials) => {
     if (!credentials) {
         credentials = JSON.parse(fs.readFileSync(path.join(dir, 'lcall.json')));
     }
-    if (credentials.token && credentials.tokenExpire > new Date().getTime()) {
-        return credentials.token;
+    if (credentials.token && (credentials.tokenExpire > Date.now())) {
+        return credentials;
     }
-    console.log('Getting new HamQTH token...')
     let login = await axios.get(`https://www.hamqth.com/xml.php?u=${credentials.login}&p=${credentials.password}`);
     let loginJson = JSON.parse(parser.toJson(login.data));
     let token = get('HamQTH.session.session_id', loginJson);
@@ -38,11 +38,22 @@ const getToken = async (credentials) => {
         process.exit(1);
     }
     credentials.token = token
-    credentials.tokenExpire = new Date().getTime() + HAMQTH_TOKEN_EXPIRE_MINUTES*60*60*1000;
+    credentials.tokenExpire = Date.now() + (HAMQTH_TOKEN_EXPIRE_MINUTES * 60 * 1000);
+    
+    let resultJson = await getQTHRecord(credentials.token, credentials.login)
+    credentials.latitude = get('HamQTH.search.latitude', resultJson);
+    credentials.longitude = get('HamQTH.search.longitude', resultJson);
+
     fs.writeFileSync(path.join(dir, 'lcall.json'), JSON.stringify(credentials));
-    return token;
+    return credentials;
 }
 
+
+const getQTHRecord = async (token, call) => {
+    let result = await axios.get(`https://www.hamqth.com/xml.php?id=${token}&callsign=${call}&prg=w1adv-lookup-tool`);
+    let resultJson = JSON.parse(parser.toJson(result.data));
+    return resultJson;
+}
 
 const login = async () => {
     const answers = await inquirer.prompt(
@@ -63,7 +74,7 @@ const login = async () => {
         await fs.mkdirSync(dir);
     }
 
-    await getToken(answers);    
+    await getSavedCredentials(answers);    
 
     console.log(`Login/password saved.`);
 };
@@ -81,10 +92,10 @@ const lookup = async () => {
     }
 
     let call = hideBin(process.argv)[1].trim();
-    let token = await getToken();
-    let result = await axios.get(`https://www.hamqth.com/xml.php?id=${token}&callsign=${call}&prg=w1adv-lookup-tool`);
-    let resultJson = JSON.parse(parser.toJson(result.data));
-    
+
+    let creds = await getSavedCredentials();
+    let resultJson = await getQTHRecord(creds.token, call)
+
     let callsign = get('HamQTH.search.callsign', resultJson);
     if (!callsign) {
         console.log(`No record found for ${call}`);
@@ -93,13 +104,28 @@ const lookup = async () => {
     callsign = callsign.toUpperCase()
     const state = get('HamQTH.search.us_state', resultJson);
     const city = get('HamQTH.search.adr_city', resultJson)
-    const country = get('HamQTH.search.adr_country', resultJson)
+    let country = get('HamQTH.search.adr_country', resultJson)
+    if (country == 'Unknown') country = get('HamQTH.search.country', resultJson)
     const name = get('HamQTH.search.adr_name', resultJson) || get('HamQTH.search.nick', resultJson)
-    if (state) {
-        console.log(`${callsign}: ${country} - ${name} - ${city}, ${state}`)
-    } else {
-        console.log(`${callsign}: ${country} - ${name} - ${city}`)
-    }
+    const distance = Math.round(geolib.getDistance({
+        latitude: Number(creds.latitude),
+        longitude: Number(creds.longitude)
+    }, {
+        latitude: Number(get('HamQTH.search.latitude', resultJson)),
+        longitude: Number(get('HamQTH.search.longitude', resultJson))
+    }) / 1000)
+    const distanceMi = Math.round(distance * 0.621371)
+    //console.log(JSON.stringify(resultJson, null, 2))
+
+    let result = []
+    
+    result.push(country)
+    result.push(name)
+    if (city && JSON.stringify(city) !== '{}') result.push(city)
+    if (state) result.push(state)
+    result.push(`${distance}km/${distanceMi}mi away`)
+
+    console.log(`${callsign}: ${result.join(' - ')}`)
 }
 
 
